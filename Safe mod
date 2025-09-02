@@ -1,1 +1,501 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>RJ 30s — Consensus + Hot/Cold</title>
+<style>
+  :root{--bg:#111;--fg:#fff;--muted:#bbb;--card:#000;
+    --ylw:yellow;--grn:lime;--red:#ff4d4d;--bdr:#555;}
+  *{box-sizing:border-box}
+  body{background:var(--bg);color:var(--fg);font-family:Arial, sans-serif;
+       margin:0;padding:18px 16px 60px}
+  h2{margin:0 0 12px}
+  .row{display:flex;gap:14px;flex-wrap:wrap}
+  .card{background:var(--card);padding:12px 14px;border:2px solid var(--ylw);
+        border-radius:12px;min-width:420px}
+  #statsBox{border-color:var(--grn)}
+  #controls{border-color:#888}
+  #trendBox{border-color:#ff8800}
+  .muted{color:var(--muted)}
+  .mono{font-family:ui-monospace,Menlo,Monaco,Consolas,"Courier New",monospace}
+  .highlight{color:var(--ylw);font-weight:bold}
+  .win{color:var(--grn);font-weight:bold}
+  .loss{color:var(--red);font-weight:bold}
+  button{background:#1e1e1e;color:#fff;border:1px solid #666;
+         border-radius:10px;padding:6px 10px;cursor:pointer}
+  button:hover{filter:brightness(1.15)}
+  button:disabled{opacity:0.6;cursor:not-allowed}
+  #resultTable{margin-top:16px;width:100%;border-collapse:collapse;font-size:14px}
+  #resultTable th,#resultTable td{border:1px solid var(--bdr);
+               padding:6px 8px;text-align:center;vertical-align:middle}
+  #resultTable thead th{position:sticky;top:0;background:#1a1a1a}
+</style>
+</head>
+<body>
+  <h2>RJ 30s — Consensus + Hot/Cold Bias</h2>
+  <div class="row">
+    <div id="predictionBox" class="card"><b>Waiting result...</b></div>
+    <div id="trendBox" class="card"><b>Trend loading…</b></div>
+    <div id="statsBox" class="card"><b>Loading stats...</b></div>
+    <div id="controls" class="card">
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <button id="pauseBtn">Pause</button>
+        <button id="resumeBtn" disabled>Resume</button>
+        <button id="resetStatsBtn">Reset Stats</button>
+        <button id="clearTableBtn">Clear Table</button>
+        <button id="downloadExcelBtn">Download Excel</button>
+        <span class="muted" id="lastSync">Last sync: —</span>
+      </div>
+      <div style="margin-top:6px" class="muted" id="modeLabel">
+        🔍 Mode: Consensus Voting + Hot/Cold Safe Guard
+      </div>
+    </div>
+  </div>
 
+  <table id="resultTable" class="mono">
+    <thead>
+      <tr>
+        <th>#</th><th>Period</th>
+        <th>Prediction</th>
+        <th>Actual</th>
+        <th>Size</th><th>Color</th>
+        <th>Logic Used</th>
+        <th>When</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+
+<script>
+(function(){
+  const API='https://draw.ar-lottery01.com/WinGo/WinGo_30S/GetHistoryIssuePage.json';
+  const REFRESH_MS=30000, MAX_ROWS=200;
+  let timer=null,lastPeriod=null,currentPrediction=null;
+  let winSize=0,lossSize=0,winColor=0,lossColor=0;
+  let lossStreak=0;
+
+  const predictionBox=document.getElementById('predictionBox');
+  const statsBox=document.getElementById('statsBox');
+  const resultTableBody=document.querySelector('#resultTable tbody');
+  const lastSyncEl=document.getElementById('lastSync');
+  const pauseBtn=document.getElementById('pauseBtn');
+  const resumeBtn=document.getElementById('resumeBtn');
+  const resetStatsBtn=document.getElementById('resetStatsBtn');
+  const clearTableBtn=document.getElementById('clearTableBtn');
+  const downloadExcelBtn=document.getElementById('downloadExcelBtn');
+
+  function getSize(n){return n>=5?'Big':'Small';}
+  function getColor(n){return n%2===0?'Red':'Green';}
+
+  function trendPrediction(results){
+    if(results.length<10) return null;
+    const last10=results.slice(0,10);
+    const big10=last10.filter(n=>n>=5).length;
+    const red10=last10.filter(n=>n%2===0).length;
+    return {
+      size: big10>=5?"Big":"Small",
+      color: red10>=5?"Red":"Green"
+    };
+  }
+
+  function oppositePrediction(pred){
+    return {
+      size: pred.size==="Big"?"Small":"Big",
+      color: pred.color==="Red"?"Green":"Red"
+    };
+  }
+
+  function majorityPrediction(results){
+    const last20=results.slice(0,20);
+    const big=last20.filter(n=>n>=5).length;
+    const red=last20.filter(n=>n%2===0).length;
+    return {
+      size: big>=10?"Big":"Small",
+      color: red>=10?"Red":"Green"
+    };
+  }
+
+  function patternPrediction(results){
+    if(results.length<4) return null;
+    const last4=results.slice(0,4);
+    const allSizeSame=last4.every(n=>getSize(n)===getSize(last4[0]));
+    const allColorSame=last4.every(n=>getColor(n)===getColor(last4[0]));
+    if(allSizeSame) return {size:getSize(last4[0])};
+    if(allColorSame) return {color:getColor(last4[0])};
+    return null;
+  }
+
+  function hotColdBias(results){
+    const last30=results.slice(0,30);
+    const big=last30.filter(n=>n>=5).length;
+    const red=last30.filter(n=>n%2===0).length;
+    return {
+      size: big>=15?"Big":"Small",
+      color: red>=15?"Red":"Green"
+    };
+  }
+
+  function consensus(results){
+    let votes={Big:0,Small:0,Red:0,Green:0};
+    let logics=[];
+
+    const trend=trendPrediction(results);
+    if(trend){votes[trend.size]++;votes[trend.color]++;logics.push("Trend");}
+
+    if(trend){
+      const opp=oppositePrediction(trend);
+      votes[opp.size]++;votes[opp.color]++;logics.push("Opposite");
+    }
+
+    const maj=majorityPrediction(results);
+    votes[maj.size]++;votes[maj.color]++;logics.push("Majority");
+
+    const pat=patternPrediction(results);
+    if(pat){if(pat.size){votes[pat.size]++;} if(pat.color){votes[pat.color]++;} logics.push("Pattern");}
+
+    const bias=hotColdBias(results);
+    votes[bias.size]++;votes[bias.color]++;logics.push("Hot/Cold");
+
+    const finalSize=votes.Big>=votes.Small?"Big":"Small";
+    const finalColor=votes.Red>=votes.Green?"Red":"Green";
+
+    return {size:finalSize,color:finalColor,logic:`Votes:${JSON.stringify(votes)}`};
+  }
+
+  function addRow({period,predText,actualNum,wasSizeWin,wasColorWin,logicUsed}){
+    const tr=document.createElement('tr');
+    tr.innerHTML=`<td>${resultTableBody.rows.length+1}</td>
+      <td>${period}</td>
+      <td>${predText}</td>
+      <td>${actualNum}</td>
+      <td class="${wasSizeWin?'win':'loss'}">${wasSizeWin?'Win':'Loss'}</td>
+      <td class="${wasColorWin?'win':'loss'}">${wasColorWin?'Win':'Loss'}</td>
+      <td>${logicUsed}</td>
+      <td>${new Date().toLocaleTimeString()}</td>`;
+    resultTableBody.insertBefore(tr,resultTableBody.firstChild);
+    while(resultTableBody.rows.length>MAX_ROWS)resultTableBody.deleteRow(resultTableBody.rows.length-1);
+  }
+
+  async function fetchResults(){
+    const res=await fetch(`${API}?ts=${Date.now()}`,{cache:'no-store'});
+    const json=await res.json();
+    const list=json?.data?.list||[];
+    const results=list.slice(0,100).map(r=>parseInt(r.number,10)).filter(Number.isFinite);
+    const latestPeriod=String(list[0]?.issueNumber??list[0]?.issue??'');
+    return {results,latestPeriod};
+  }
+
+  async function tick(){
+    try{
+      const {results,latestPeriod}=await fetchResults();
+      lastSyncEl.textContent='Last sync: '+new Date().toLocaleTimeString();
+      if(!results.length) return;
+
+      if(latestPeriod!==lastPeriod){
+        if(currentPrediction){
+          const actualNum=results[0];
+          const actualSize=getSize(actualNum);
+          const actualColor=getColor(actualNum);
+          const wasSizeWin=(currentPrediction.size===actualSize);
+          const wasColorWin=(currentPrediction.color===actualColor);
+
+          if(wasSizeWin) winSize++,lossStreak=0; else lossSize++,lossStreak++;
+          if(wasColorWin) winColor++,lossStreak=0; else lossColor++,lossStreak++;
+
+          addRow({
+            period:latestPeriod,
+            predText:`Size:${currentPrediction.size} | Color:${currentPrediction.color}`,
+            actualNum,wasSizeWin,wasColorWin,
+            logicUsed:currentPrediction.logic
+          });
+        }
+
+        const final=consensus(results);
+        predictionBox.innerHTML=`<b class="win">Prediction → Size:${final.size} | Color:${final.color}</b>`;
+        currentPrediction={size:final.size,color:final.color,logic:final.logic};
+        lastPeriod=latestPeriod;
+      }
+
+      statsBox.innerHTML=`<b>Size →</b> W:${winSize} / L:${lossSize}<br>
+                          <b>Color →</b> W:${winColor} / L:${lossColor}<br>
+                          Loss streak:${lossStreak}`;
+    }catch(e){
+      predictionBox.innerHTML=`<b style="color:red">Error</b> (${e.message})`;
+    }
+  }
+
+  function start(){ if(!timer) timer=setInterval(tick,REFRESH_MS); }
+  function stop(){ if(timer){ clearInterval(timer); timer=null; } }
+
+  pauseBtn.onclick=()=>{ stop(); pauseBtn.disabled=true; resumeBtn.disabled=false; };
+  resumeBtn.onclick=()=>{ start(); resumeBtn.disabled=true; pauseBtn.disabled=false; tick(); };
+  resetStatsBtn.onclick=()=>{ winSize=lossSize=winColor=lossColor=lossStreak=0; statsBox.innerHTML='Reset!'; };
+  clearTableBtn.onclick=()=>{ resultTableBody.innerHTML=''; };
+
+  downloadExcelBtn.onclick=()=>{
+    const table=document.getElementById("resultTable");
+    const ws=XLSX.utils.table_to_sheet(table);
+    const wb=XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb,ws,"Results");
+    const filename=`RJ_Results_${(new Date()).toISOString().replace(/[:.]/g,'-')}.xlsx`;
+    XLSX.writeFile(wb,filename);
+  };
+
+  tick();start();
+})();
+</script>
+</body>
+</html><!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>RJ 30s — Consensus + Hot/Cold</title>
+<style>
+  :root{--bg:#111;--fg:#fff;--muted:#bbb;--card:#000;
+    --ylw:yellow;--grn:lime;--red:#ff4d4d;--bdr:#555;}
+  *{box-sizing:border-box}
+  body{background:var(--bg);color:var(--fg);font-family:Arial, sans-serif;
+       margin:0;padding:18px 16px 60px}
+  h2{margin:0 0 12px}
+  .row{display:flex;gap:14px;flex-wrap:wrap}
+  .card{background:var(--card);padding:12px 14px;border:2px solid var(--ylw);
+        border-radius:12px;min-width:420px}
+  #statsBox{border-color:var(--grn)}
+  #controls{border-color:#888}
+  #trendBox{border-color:#ff8800}
+  .muted{color:var(--muted)}
+  .mono{font-family:ui-monospace,Menlo,Monaco,Consolas,"Courier New",monospace}
+  .highlight{color:var(--ylw);font-weight:bold}
+  .win{color:var(--grn);font-weight:bold}
+  .loss{color:var(--red);font-weight:bold}
+  button{background:#1e1e1e;color:#fff;border:1px solid #666;
+         border-radius:10px;padding:6px 10px;cursor:pointer}
+  button:hover{filter:brightness(1.15)}
+  button:disabled{opacity:0.6;cursor:not-allowed}
+  #resultTable{margin-top:16px;width:100%;border-collapse:collapse;font-size:14px}
+  #resultTable th,#resultTable td{border:1px solid var(--bdr);
+               padding:6px 8px;text-align:center;vertical-align:middle}
+  #resultTable thead th{position:sticky;top:0;background:#1a1a1a}
+</style>
+</head>
+<body>
+  <h2>RJ 30s — Consensus + Hot/Cold Bias</h2>
+  <div class="row">
+    <div id="predictionBox" class="card"><b>Waiting result...</b></div>
+    <div id="trendBox" class="card"><b>Trend loading…</b></div>
+    <div id="statsBox" class="card"><b>Loading stats...</b></div>
+    <div id="controls" class="card">
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <button id="pauseBtn">Pause</button>
+        <button id="resumeBtn" disabled>Resume</button>
+        <button id="resetStatsBtn">Reset Stats</button>
+        <button id="clearTableBtn">Clear Table</button>
+        <button id="downloadExcelBtn">Download Excel</button>
+        <span class="muted" id="lastSync">Last sync: —</span>
+      </div>
+      <div style="margin-top:6px" class="muted" id="modeLabel">
+        🔍 Mode: Consensus Voting + Hot/Cold Safe Guard
+      </div>
+    </div>
+  </div>
+
+  <table id="resultTable" class="mono">
+    <thead>
+      <tr>
+        <th>#</th><th>Period</th>
+        <th>Prediction</th>
+        <th>Actual</th>
+        <th>Size</th><th>Color</th>
+        <th>Logic Used</th>
+        <th>When</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+
+<script>
+(function(){
+  const API='https://draw.ar-lottery01.com/WinGo/WinGo_30S/GetHistoryIssuePage.json';
+  const REFRESH_MS=30000, MAX_ROWS=200;
+  let timer=null,lastPeriod=null,currentPrediction=null;
+  let winSize=0,lossSize=0,winColor=0,lossColor=0;
+  let lossStreak=0;
+
+  const predictionBox=document.getElementById('predictionBox');
+  const statsBox=document.getElementById('statsBox');
+  const resultTableBody=document.querySelector('#resultTable tbody');
+  const lastSyncEl=document.getElementById('lastSync');
+  const pauseBtn=document.getElementById('pauseBtn');
+  const resumeBtn=document.getElementById('resumeBtn');
+  const resetStatsBtn=document.getElementById('resetStatsBtn');
+  const clearTableBtn=document.getElementById('clearTableBtn');
+  const downloadExcelBtn=document.getElementById('downloadExcelBtn');
+
+  function getSize(n){return n>=5?'Big':'Small';}
+  function getColor(n){return n%2===0?'Red':'Green';}
+
+  function trendPrediction(results){
+    if(results.length<10) return null;
+    const last10=results.slice(0,10);
+    const big10=last10.filter(n=>n>=5).length;
+    const red10=last10.filter(n=>n%2===0).length;
+    return {
+      size: big10>=5?"Big":"Small",
+      color: red10>=5?"Red":"Green"
+    };
+  }
+
+  function oppositePrediction(pred){
+    return {
+      size: pred.size==="Big"?"Small":"Big",
+      color: pred.color==="Red"?"Green":"Red"
+    };
+  }
+
+  function majorityPrediction(results){
+    const last20=results.slice(0,20);
+    const big=last20.filter(n=>n>=5).length;
+    const red=last20.filter(n=>n%2===0).length;
+    return {
+      size: big>=10?"Big":"Small",
+      color: red>=10?"Red":"Green"
+    };
+  }
+
+  function patternPrediction(results){
+    if(results.length<4) return null;
+    const last4=results.slice(0,4);
+    const allSizeSame=last4.every(n=>getSize(n)===getSize(last4[0]));
+    const allColorSame=last4.every(n=>getColor(n)===getColor(last4[0]));
+    if(allSizeSame) return {size:getSize(last4[0])};
+    if(allColorSame) return {color:getColor(last4[0])};
+    return null;
+  }
+
+  function hotColdBias(results){
+    const last30=results.slice(0,30);
+    const big=last30.filter(n=>n>=5).length;
+    const red=last30.filter(n=>n%2===0).length;
+    return {
+      size: big>=15?"Big":"Small",
+      color: red>=15?"Red":"Green"
+    };
+  }
+
+  function consensus(results){
+    let votes={Big:0,Small:0,Red:0,Green:0};
+    let logics=[];
+
+    const trend=trendPrediction(results);
+    if(trend){votes[trend.size]++;votes[trend.color]++;logics.push("Trend");}
+
+    if(trend){
+      const opp=oppositePrediction(trend);
+      votes[opp.size]++;votes[opp.color]++;logics.push("Opposite");
+    }
+
+    const maj=majorityPrediction(results);
+    votes[maj.size]++;votes[maj.color]++;logics.push("Majority");
+
+    const pat=patternPrediction(results);
+    if(pat){if(pat.size){votes[pat.size]++;} if(pat.color){votes[pat.color]++;} logics.push("Pattern");}
+
+    const bias=hotColdBias(results);
+    votes[bias.size]++;votes[bias.color]++;logics.push("Hot/Cold");
+
+    const finalSize=votes.Big>=votes.Small?"Big":"Small";
+    const finalColor=votes.Red>=votes.Green?"Red":"Green";
+
+    return {size:finalSize,color:finalColor,logic:`Votes:${JSON.stringify(votes)}`};
+  }
+
+  function addRow({period,predText,actualNum,wasSizeWin,wasColorWin,logicUsed}){
+    const tr=document.createElement('tr');
+    tr.innerHTML=`<td>${resultTableBody.rows.length+1}</td>
+      <td>${period}</td>
+      <td>${predText}</td>
+      <td>${actualNum}</td>
+      <td class="${wasSizeWin?'win':'loss'}">${wasSizeWin?'Win':'Loss'}</td>
+      <td class="${wasColorWin?'win':'loss'}">${wasColorWin?'Win':'Loss'}</td>
+      <td>${logicUsed}</td>
+      <td>${new Date().toLocaleTimeString()}</td>`;
+    resultTableBody.insertBefore(tr,resultTableBody.firstChild);
+    while(resultTableBody.rows.length>MAX_ROWS)resultTableBody.deleteRow(resultTableBody.rows.length-1);
+  }
+
+  async function fetchResults(){
+    const res=await fetch(`${API}?ts=${Date.now()}`,{cache:'no-store'});
+    const json=await res.json();
+    const list=json?.data?.list||[];
+    const results=list.slice(0,100).map(r=>parseInt(r.number,10)).filter(Number.isFinite);
+    const latestPeriod=String(list[0]?.issueNumber??list[0]?.issue??'');
+    return {results,latestPeriod};
+  }
+
+  async function tick(){
+    try{
+      const {results,latestPeriod}=await fetchResults();
+      lastSyncEl.textContent='Last sync: '+new Date().toLocaleTimeString();
+      if(!results.length) return;
+
+      if(latestPeriod!==lastPeriod){
+        if(currentPrediction){
+          const actualNum=results[0];
+          const actualSize=getSize(actualNum);
+          const actualColor=getColor(actualNum);
+          const wasSizeWin=(currentPrediction.size===actualSize);
+          const wasColorWin=(currentPrediction.color===actualColor);
+
+          if(wasSizeWin) winSize++,lossStreak=0; else lossSize++,lossStreak++;
+          if(wasColorWin) winColor++,lossStreak=0; else lossColor++,lossStreak++;
+
+          addRow({
+            period:latestPeriod,
+            predText:`Size:${currentPrediction.size} | Color:${currentPrediction.color}`,
+            actualNum,wasSizeWin,wasColorWin,
+            logicUsed:currentPrediction.logic
+          });
+        }
+
+        const final=consensus(results);
+        predictionBox.innerHTML=`<b class="win">Prediction → Size:${final.size} | Color:${final.color}</b>`;
+        currentPrediction={size:final.size,color:final.color,logic:final.logic};
+        lastPeriod=latestPeriod;
+      }
+
+      statsBox.innerHTML=`<b>Size →</b> W:${winSize} / L:${lossSize}<br>
+                          <b>Color →</b> W:${winColor} / L:${lossColor}<br>
+                          Loss streak:${lossStreak}`;
+    }catch(e){
+      predictionBox.innerHTML=`<b style="color:red">Error</b> (${e.message})`;
+    }
+  }
+
+  function start(){ if(!timer) timer=setInterval(tick,REFRESH_MS); }
+  function stop(){ if(timer){ clearInterval(timer); timer=null; } }
+
+  pauseBtn.onclick=()=>{ stop(); pauseBtn.disabled=true; resumeBtn.disabled=false; };
+  resumeBtn.onclick=()=>{ start(); resumeBtn.disabled=true; pauseBtn.disabled=false; tick(); };
+  resetStatsBtn.onclick=()=>{ winSize=lossSize=winColor=lossColor=lossStreak=0; statsBox.innerHTML='Reset!'; };
+  clearTableBtn.onclick=()=>{ resultTableBody.innerHTML=''; };
+
+  downloadExcelBtn.onclick=()=>{
+    const table=document.getElementById("resultTable");
+    const ws=XLSX.utils.table_to_sheet(table);
+    const wb=XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb,ws,"Results");
+    const filename=`RJ_Results_${(new Date()).toISOString().replace(/[:.]/g,'-')}.xlsx`;
+    XLSX.writeFile(wb,filename);
+  };
+
+  tick();start();
+})();
+</script>
+</body>
+</html>
